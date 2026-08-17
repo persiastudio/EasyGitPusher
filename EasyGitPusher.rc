@@ -1,0 +1,40 @@
+// GitPusher.rc - recursos embutidos no EXE
+//
+// Compilado pelo rc.exe (resource compiler) durante o build do Visual Studio.
+// Os PNGs/ICO referenciados abaixo sao embutidos no .exe final, sem precisar ir
+// como arquivos separados para a pasta de saida.
+//
+// Como adicionar ao projeto VS:
+//   1. Copie este arquivo (GitPusher.rc), o resource.h e os PNGs/ICO para
+//      a mesma pasta onde esta o GitPusher.cpp
+//   2. No Solution Explorer, botao direito no projeto > Add > Existing Item
+//   3. Selecione GitPusher.rc, resource.h e os demais arquivos
+//   4. VS vai colocar GitPusher.rc em "Resource Files" automaticamente
+//   5. Recompile (Ctrl+Shift+B)
+//
+// Importante: os arquivos precisam estar na mesma pasta do .rc quando o
+// resource compiler rodar. Se mudar de lugar, atualize o caminho abaixo.
+
+#include "resource.h"
+
+// Icone da janela (aparece na barra de tarefas, alt+tab e no canto sup. esq.)
+// Substitua "favicon.ico" pelo nome do seu arquivo .ico se for diferente.
+// Importante: o nome aqui (IDI_GITPUSHER) deve ser o mesmo usado no .cpp
+// em MAKEINTRESOURCEW(IDI_GITPUSHER). O valor 107 esta definido em resource.h.
+IDI_GITPUSHER       ICON        "favicon.ico"
+
+// Logo Persia Studio no rodape da sidebar
+IDB_LOGO            PNG         "logo.png"
+
+// Fundo da janela principal (carbon fiber, gradiente, textura, etc.)
+IDB_BG              PNG         "bg.png"
+
+// Sprites do botao "+" (3 estados: normal / hover / clicado)
+IDB_SPR_PLUS_0      PNG         "spr_plus_0.png"
+IDB_SPR_PLUS_1      PNG         "spr_plus_1.png"
+IDB_SPR_PLUS_2      PNG         "spr_plus_2.png"
+
+// Sprites da lixeira (3 estados: normal / hover / clicado)
+IDB_SPR_TRASH_0     PNG         "spr_trash_0.png"
+IDB_SPR_TRASH_1     PNG         "spr_trash_1.png"
+IDB_SPR_TRASH_2     PNG         "spr_trash_2.png"
