@@ -135,7 +135,7 @@ static std::wstring g_branchLookupUrl;
 static HWND g_hwndFooter = nullptr;
 static constexpr int FOOTER_X = 246;
 static constexpr int FOOTER_Y_OFFSET = -28;
-static constexpr wchar_t FOOTER_TEXT[] = L"V1.0.0 - 17/08/2026";
+static constexpr wchar_t FOOTER_TEXT[] = L"V1.0.1 - 17/08/2026";
 static constexpr COLORREF FOOTER_TEXT_COLOR = RGB(0, 182, 255);
 
 // Estado hover/click para owner-draw do botao + e lixeira.
@@ -2010,11 +2010,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
 
     RegisterClassExW(&wc);
 
-    //JANELA FICA AQUI
+    //JANELA FICA AQUI - centralizada na area de trabalho (exclui taskbar)
+    RECT rcWork{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &rcWork, 0);
+    const int winX = rcWork.left + ((rcWork.right - rcWork.left) - 900) / 2;
+    const int winY = rcWork.top  + ((rcWork.bottom - rcWork.top) - 550) / 2;
     g_hMainWnd = CreateWindowExW(
         0, className, L"EasyGitPusher",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 900, 550,
+        winX, winY, 900, 550,
         nullptr, nullptr, hInstance, nullptr
     );
 
