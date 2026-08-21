@@ -90,7 +90,7 @@ constexpr int TRASH_ICON_W = 30; // largura da área clicável da lixeira, dentr
 //  Equivalente C++ das macros #macro do GML: constexpr const wchar_t*.
 // ---------------------------------------------------------------------------
 constexpr const wchar_t* APP_TITLE       = L"EasyGitPusher";
-constexpr const wchar_t* APP_VERSION     = L"V1.1.0 - 18/08/2026";
+constexpr const wchar_t* APP_VERSION     = L"V1.1.1 - 21/08/2026";
 constexpr const wchar_t* LABEL_SIDEBAR  = L"Meus repos";
 constexpr const wchar_t* LABEL_FOLDER    = L"Pasta a enviar:";
 constexpr const wchar_t* BTN_BROWSE     = L"Procurar...";
@@ -99,6 +99,10 @@ constexpr const wchar_t* LABEL_TOKEN    = L"Token de acesso (Personal Access Tok
 constexpr const wchar_t* BTN_SHOW_TOKEN = L"Mostrar";
 constexpr const wchar_t* LABEL_BRANCH   = L"Selecione a Branch:";
 constexpr const wchar_t* COMBO_BRANCH_PLACEHOLDER = L"(branch)";
+// Sufixos informativos mostrados no dropdown quando o ls-remote nao achou
+// branches de verdade (repo recem-criado / URL com problema).
+constexpr const wchar_t* COMBO_EMPTY_REPO_LABEL   = L" (repositório vazio)";
+constexpr const wchar_t* COMBO_LOOKUP_FAIL_LABEL  = L" (verificação falhou)";
 constexpr const wchar_t* LABEL_COMMIT   = L"Mensagem do commit (opcional):";
 constexpr const wchar_t* BTN_PUSH       = L"PUSH";
 constexpr const wchar_t* BTN_PUSH_SENDING = L"Enviando...";
@@ -113,7 +117,7 @@ constexpr const wchar_t* DIALOG_TITLE_INCOMPLETE = L"Campos incompletos";
 constexpr const wchar_t* MSG_PUSH_OK     = L"Push realizado com sucesso!";
 constexpr const wchar_t* MSG_PUSH_FAIL   = L"O push falhou. Veja o log na janela para detalhes.";
 constexpr const wchar_t* MSG_BAD_REPO    = L"Link de repositório inválido.\nUse https://github.com/usuario/repo.git ou git@github.com:usuario/repo.git";
-constexpr const wchar_t* MSG_NO_BRANCH  = L"Selecione um branch antes de enviar.\nSe o dropdown está vazio, aguarde o lookup automático terminar\nou verifique se o link está correto.";
+constexpr const wchar_t* MSG_NO_BRANCH  = L"Selecione um branch antes de enviar.\nSe o dropdown está vazio, aguarde o lookup automático terminar,\nverifique se o link está correto ou se o repositório realmente existe.";
 constexpr const wchar_t* MSG_NO_FIELDS   = L"Preencha a pasta, o link do repositório e o token antes de continuar.";
 constexpr const wchar_t* MSG_NO_SAVE_FIELDS = L"Preencha ao menos a pasta ou o link do repositório antes de adicionar a lista.";
 constexpr const wchar_t* MSG_THREAD_FAIL  = L"Não foi possível iniciar o processo de push.";
@@ -198,6 +202,8 @@ static HMENU CtrlId(int id) { return reinterpret_cast<HMENU>(static_cast<INT_PTR
 static bool IsValidGitUrl(const std::wstring& url);
 // Fallback GDI para desenhar a lixeira quando o sprite PNG não estiver carregado.
 static void DrawTrashIcon(HDC hdc, const RECT& area, COLORREF bg, COLORREF fg);
+// Deleta recursivamente um diretório temporário (usado pelo backup).
+static void DeleteDirectoryRecursive(const std::wstring& path);
 
 // ---------------------------------------------------------------------------
 //  Perfis de repositório (barra lateral "Meus repos")
@@ -777,6 +783,11 @@ struct PushParams
 //  restore vai desfazer a alteracao.
 // ---------------------------------------------------------------------------
 
+// Comprimento do caminho base da pasta do usuario. Usado por
+// CollectTreeRelativePaths para derivar caminhos relativos da arvore
+// (somente quando a pasta ainda nao e um repositorio git).
+static size_t g_backupRootLen = 0;
+
 // Cria recursivamente todos os diretorios pais de `path` (que e um caminho
 // de arquivo completo). Idempotente.
 static void EnsureParentDirExists(const std::wstring& path)
@@ -799,13 +810,59 @@ static void EnsureParentDirExists(const std::wstring& path)
     CreateDirectoryW(dir.c_str(), nullptr);
 }
 
-// Copia todos os arquivos rastreados pelo git (git ls-files) de `folder`
-// para um diretorio temporario unico. Retorna o caminho do backup dir,
-// ou string vazia em caso de falha (inclui o caso de nao ter repo git).
-static std::wstring BackupWorkingTree(const std::wstring& folder)
+// Varre recursivamente a arvore de arquivos a partir de `dir`, acumulando
+// os caminhos relativos (separados por '\\') em `out`. Usada so quando a
+// pasta ainda nao e um repositorio git (backup V1.1.1).
+static void CollectTreeRelativePaths(const std::wstring& dir,
+                                     std::vector<std::wstring>& out)
 {
+    const std::wstring searchPath = dir + L"\\*";
+    WIN32_FIND_DATAW fd{};
+    const HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do
+    {
+        const std::wstring name = fd.cFileName;
+        if (name == L"." || name == L".." || name == L".git") continue;
+        const std::wstring full = dir + L"\\" + name;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            CollectTreeRelativePaths(full, out);
+        }
+        else
+        {
+            // Caminho relativo a partir da raiz da pasta do usuario.
+            std::wstring rel = full.substr(g_backupRootLen);
+            if (!rel.empty() && (rel[0] == L'\\' || rel[0] == L'/'))
+                rel.erase(rel.begin());
+            out.push_back(rel);
+        }
+    } while (FindNextFileW(hFind, &fd));
+
+    FindClose(hFind);
+}
+
+// Copia todos os arquivos rastreados pelo git (git ls-files) de `folder`
+// para um diretorio temporario unico. Se a pasta ainda NAO e um repositorio
+// git (caso comum: o push e que vai rodar o `git init` depois), cai para uma
+// varredura completa da arvore de arquivos (ignorando .git), que e exatamente
+// o que o `git add -A` do push vai enviar.
+//
+// Retorna o caminho do backup dir, ou string vazia em caso de falha
+// (inclui o caso de nao ter repo git). Em falha, preenche `outError` com
+// uma descricao da causa para o log.
+static std::wstring BackupWorkingTree(const std::wstring& folder,
+                                      std::wstring& outError)
+{
+    outError.clear();
+
     wchar_t tempPath[MAX_PATH] = {0};
-    if (!GetTempPathW(MAX_PATH, tempPath)) return L"";
+    if (!GetTempPathW(MAX_PATH, tempPath))
+    {
+        outError = L"Nao foi possivel obter o diretorio temporario do sistema (GetTempPathW falhou).";
+        return L"";
+    }
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -816,24 +873,93 @@ static std::wstring BackupWorkingTree(const std::wstring& folder)
         st.wHour, st.wMinute, st.wSecond,
         static_cast<unsigned long>(GetCurrentProcessId()));
 
-    if (!CreateDirectoryW(backupDirBuf, nullptr)) return L"";
-
-    std::wstring lsOutput;
-    if (!RunCommand(L"git ls-files", folder, lsOutput)) return L"";
-
-    std::wistringstream ss(lsOutput);
-    std::wstring relPath;
-    while (std::getline(ss, relPath))
+    if (!CreateDirectoryW(backupDirBuf, nullptr))
     {
-        if (!relPath.empty() && relPath.back() == L'\r') relPath.pop_back();
-        if (relPath.empty()) continue;
+        outError = L"Nao foi possivel criar o diretorio de backup em: " +
+                   std::wstring(backupDirBuf) +
+                   L" (verifique permissoes e espaco em disco no diretorio temp).";
+        return L"";
+    }
 
+    // Se a pasta ainda nao e um repositorio git, git ls-files falha (e o que
+    // derrubava o backup no V1.1.0). Nesse caso copiamos a arvore inteira.
+    const std::wstring gitDir = folder + L"\\.git";
+    const DWORD attrs = GetFileAttributesW(gitDir.c_str());
+    const bool hasGit = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+
+    std::vector<std::wstring> relPaths;
+    if (hasGit)
+    {
+        std::wstring lsOutput;
+        if (RunCommand(L"git ls-files", folder, lsOutput))
+        {
+            std::wistringstream ss(lsOutput);
+            std::wstring relPath;
+            while (std::getline(ss, relPath))
+            {
+                if (!relPath.empty() && relPath.back() == L'\r') relPath.pop_back();
+                if (relPath.empty()) continue;
+                // Normaliza para backslash (caminho do Windows).
+                for (wchar_t& c : relPath) if (c == L'/') c = L'\\';
+                relPaths.push_back(relPath);
+            }
+        }
+    }
+    if (relPaths.empty())
+    {
+        // Sem repo git ainda: varre tudo (git add -A vai mandar tudo mesmo).
+        // Pula .git por seguranca (nunca deve existir aqui, mas nao custa).
+        // Remove barras finais para montar caminhos relativos limpos.
+        std::wstring base = folder;
+        while (!base.empty() && (base.back() == L'\\' || base.back() == L'/'))
+            base.pop_back();
+        g_backupRootLen = base.size();
+
+        const std::wstring searchPath = base + L"\\*";
+        WIN32_FIND_DATAW fd{};
+        const HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                const std::wstring name = fd.cFileName;
+                if (name == L"." || name == L".." || name == L".git") continue;
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    CollectTreeRelativePaths(base + L"\\" + name, relPaths);
+                else
+                    relPaths.push_back(name);
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+
+    bool anyFailure = false;
+    for (const auto& relPath : relPaths)
+    {
         const std::wstring srcPath = folder + L"\\" + relPath;
         const std::wstring dstPath = std::wstring(backupDirBuf) + L"\\" + relPath;
 
         EnsureParentDirExists(dstPath);
         // FALSE = sobrescreve se ja existir.
-        CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE);
+        if (!CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE))
+        {
+            // Falha legitima de copia (ex.: arquivo sumiu no meio do caminho
+            // ou disco cheio). Reporta e aborta: backup incompleto nao serve.
+            anyFailure = true;
+            const DWORD err = GetLastError();
+            wchar_t errBuf[512] = {0};
+            FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                nullptr, err, 0, errBuf, 512, nullptr);
+            outError = L"Falha ao copiar '" + relPath + L"' para o backup: " +
+                       errBuf;
+            break;
+        }
+    }
+
+    if (anyFailure)
+    {
+        DeleteDirectoryRecursive(backupDirBuf);
+        return L"";
     }
 
     return backupDirBuf;
@@ -982,10 +1108,13 @@ static void DoPushWorker(const std::wstring& folder, const std::wstring& repo,
     // rebase/checkout), o restore no final vai desfazer qualquer alteracao
     // nos arquivos locais. Se o backup falhar, abortamos o push.
     AppendLog(L"[1/9] Fazendo backup de segurança dos arquivos locais...");
-    std::wstring backupDir = BackupWorkingTree(folder);
+    std::wstring backupError;
+    std::wstring backupDir = BackupWorkingTree(folder, backupError);
     if (backupDir.empty())
     {
         AppendLog(L"[ERRO] Falha ao fazer backup dos arquivos locais.");
+        if (!backupError.empty())
+            AppendLog(L"       Detalhe: " + backupError);
         AppendLog(L"       O push foi abortado por segurança - sem backup, não");
         AppendLog(L"       arriscamos modificar seus arquivos em caso de erro.");
         AppendLog(L"       Verifique espaço em disco e permissões no diretório temp.");
@@ -1072,6 +1201,10 @@ static void DoPushWorker(const std::wstring& folder, const std::wstring& repo,
             std::wstring branch = g_selectedBranch;
             if (localBranch.empty() || localBranch == L"HEAD")
             {
+                // Repo local sem commits ainda (acabou de ser iniciado):
+                // cria a branch escolhida. O push -u na sequencia cria a
+                // branch no remoto automaticamente (repo novo / vazio).
+                AppendLog(L"Branch local ainda não existe - criando '" + branch + L"'...");
                 RunCommand(L"git checkout -B " + branch, folder, output);
                 AppendLog(output);
             }
@@ -1709,6 +1842,8 @@ constexpr UINT WM_BRANCHES_READY = WM_APP + 2;
 struct BranchLookupResult {
     std::vector<std::wstring> branches;
     std::wstring url;
+    bool lookupFailed = false; // true se o git ls-remote falhou (URL/rede/token)
+    bool isEmptyRepo   = false; // true se ls-remote OK mas sem branches (repo novo)
 };
 
 static unsigned __stdcall BranchLookupThread(void* rawArg)
@@ -1749,6 +1884,20 @@ static unsigned __stdcall BranchLookupThread(void* rawArg)
                 result->branches.push_back(ref.substr(prefixLen));
             }
         }
+    }
+
+    // Nenhuma branch listada: ou o repo remoto acabou de ser criado (vazio -
+    // ls-remote responde OK mas sem refs) ou o lookup falhou (URL errada /
+    // rede / token). Nos DOIS casos oferecemos os nomes padrao main/master:
+    // se o repo for mesmo novo, o `git push -u origin main` cria a branch
+    // automaticamente; se a URL estiver errada, o erro real aparece no log
+    // do push. (Bug V1.1.0: dropdown vazio impedia o primeiro push.)
+    result->lookupFailed = !ok;
+    if (result->branches.empty())
+    {
+        result->isEmptyRepo = true;
+        result->branches.push_back(L"main");
+        result->branches.push_back(L"master");
     }
 
     if (url == g_branchLookupUrl) {
@@ -2066,6 +2215,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_selectedProfile >= 0)
             LoadProfileIntoFields(g_selectedProfile);
 
+        // SetWindowText programatico nao dispara EN_CHANGE, entao o lookup
+        // de branches precisa ser pedido explicitamente ao carregar um perfil
+        // (bug V1.1.0: dropdown ficava preso em "(branch)" ao abrir o app).
+        {
+            const std::wstring url = GetWindowTextStr(g_hEditRepo);
+            if (!url.empty()) RequestBranchLookup(url);
+        }
+
         return 0;
     }
 
@@ -2112,6 +2269,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_selectedProfile = index;
                 LoadProfileIntoFields(index);
                 SaveProfilesConfig(); // persiste qual repositório foi selecionado por último
+                // Recarrega as branches do repositorio recém-selecionado.
+                const std::wstring url = GetWindowTextStr(g_hEditRepo);
+                if (!url.empty()) RequestBranchLookup(url);
             }
         }
         return 0;
@@ -2226,19 +2386,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         SendMessageW(g_hComboBranch, CB_RESETCONTENT, 0, 0);
         g_remoteBranches.clear();
-        if (result->branches.empty()) {
-            SendMessageW(g_hComboBranch, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"(branch)"));
+
+        if (result->branches.empty())
+        {
+            // Nunca deve acontecer (a thread sempre preenche main/master),
+            // mas por seguranca mantem o placeholder em vez de um combo vazio.
+            SendMessageW(g_hComboBranch, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(COMBO_BRANCH_PLACEHOLDER));
             SendMessageW(g_hComboBranch, CB_SETCURSEL, 0, 0);
-        } else {
-            int selectIdx = 0;
-            for (size_t i = 0; i < result->branches.size(); ++i) {
-                SendMessageW(g_hComboBranch, CB_ADDSTRING, 0,
-                    reinterpret_cast<LPARAM>(result->branches[i].c_str()));
-                g_remoteBranches.push_back(result->branches[i]);
-                if (result->branches[i] == L"main")  selectIdx = static_cast<int>(i);
-            }
-            SendMessageW(g_hComboBranch, CB_SETCURSEL, selectIdx, 0);
+            return 0;
         }
+
+        int selectIdx = 0;
+        const bool emptyRepo = result->isEmptyRepo;
+        const bool lookupFail = result->lookupFailed;
+        for (size_t i = 0; i < result->branches.size(); ++i)
+        {
+            std::wstring label = result->branches[i];
+            // Sinaliza no proprio dropdown por que main/master aparecem
+            // sem ter vindo do remoto (repo novo ou falha na verificacao).
+            if (emptyRepo && !lookupFail)
+                label += COMBO_EMPTY_REPO_LABEL;
+            else if (lookupFail)
+                label += COMBO_LOOKUP_FAIL_LABEL;
+
+            SendMessageW(g_hComboBranch, CB_ADDSTRING, 0,
+                reinterpret_cast<LPARAM>(label.c_str()));
+            g_remoteBranches.push_back(result->branches[i]);
+            if (result->branches[i] == L"main")  selectIdx = static_cast<int>(i);
+        }
+        SendMessageW(g_hComboBranch, CB_SETCURSEL, selectIdx, 0);
         return 0;
     }
     case WM_ERASEBKGND:
