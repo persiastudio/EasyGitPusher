@@ -47,6 +47,7 @@
 #include <memory>
 #include <string>
 #include <sstream>    // std::wistringstream (parsing do git ls-remote)
+#include <fstream>    // std::ifstream (scan de marcadores de conflito)
 #include <vector>
 #include <atomic>
 #include <gdiplus.h>
@@ -83,6 +84,41 @@ constexpr int SIDEBAR_X = 15;
 constexpr int SIDEBAR_WIDTH = 210;
 constexpr int MAIN_X = SIDEBAR_X + SIDEBAR_WIDTH + 21; // -4 pixels (alinhamento) // conteúdo principal começa aqui
 constexpr int TRASH_ICON_W = 30; // largura da área clicável da lixeira, dentro de cada item da lista
+
+// ---------------------------------------------------------------------------
+//  Textos fixos da UI (edite aqui pra mudar em todo lugar)
+//  Equivalente C++ das macros #macro do GML: constexpr const wchar_t*.
+// ---------------------------------------------------------------------------
+constexpr const wchar_t* APP_TITLE       = L"EasyGitPusher";
+constexpr const wchar_t* APP_VERSION     = L"V1.1.0 - 18/08/2026";
+constexpr const wchar_t* LABEL_SIDEBAR  = L"Meus repos";
+constexpr const wchar_t* LABEL_FOLDER    = L"Pasta a enviar:";
+constexpr const wchar_t* BTN_BROWSE     = L"Procurar...";
+constexpr const wchar_t* LABEL_REPO     = L"Link do repositório (ex: https://github.com/user/repo.git):";
+constexpr const wchar_t* LABEL_TOKEN    = L"Token de acesso (Personal Access Token):";
+constexpr const wchar_t* BTN_SHOW_TOKEN = L"Mostrar";
+constexpr const wchar_t* LABEL_BRANCH   = L"Selecione a Branch:";
+constexpr const wchar_t* COMBO_BRANCH_PLACEHOLDER = L"(branch)";
+constexpr const wchar_t* LABEL_COMMIT   = L"Mensagem do commit (opcional):";
+constexpr const wchar_t* BTN_PUSH       = L"PUSH";
+constexpr const wchar_t* BTN_PUSH_SENDING = L"Enviando...";
+constexpr const wchar_t* LABEL_LOG      = L"Log do Git:";
+constexpr const wchar_t* DIALOG_TITLE_DONE  = L"Concluído";
+constexpr const wchar_t* DIALOG_TITLE_ERROR = L"Erro";
+constexpr const wchar_t* DIALOG_TITLE_WARNING = L"Aviso";
+constexpr const wchar_t* DIALOG_TITLE_CONFIRM = L"Confirmar";
+constexpr const wchar_t* DIALOG_TITLE_REMOVE = L"Remover repositório";
+constexpr const wchar_t* DIALOG_TITLE_FIELDS = L"Campos vazios";
+constexpr const wchar_t* DIALOG_TITLE_INCOMPLETE = L"Campos incompletos";
+constexpr const wchar_t* MSG_PUSH_OK     = L"Push realizado com sucesso!";
+constexpr const wchar_t* MSG_PUSH_FAIL   = L"O push falhou. Veja o log na janela para detalhes.";
+constexpr const wchar_t* MSG_BAD_REPO    = L"Link de repositório inválido.\nUse https://github.com/usuario/repo.git ou git@github.com:usuario/repo.git";
+constexpr const wchar_t* MSG_NO_BRANCH  = L"Selecione um branch antes de enviar.\nSe o dropdown está vazio, aguarde o lookup automático terminar\nou verifique se o link está correto.";
+constexpr const wchar_t* MSG_NO_FIELDS   = L"Preencha a pasta, o link do repositório e o token antes de continuar.";
+constexpr const wchar_t* MSG_NO_SAVE_FIELDS = L"Preencha ao menos a pasta ou o link do repositório antes de adicionar a lista.";
+constexpr const wchar_t* MSG_THREAD_FAIL  = L"Não foi possível iniciar o processo de push.";
+constexpr const wchar_t* MSG_FOLDER_FAIL  = L"Não foi possível abrir o seletor de pastas.";
+constexpr const wchar_t* MSG_COM_FAIL    = L"Falha ao inicializar COM.";
 
 // ---------------------------------------------------------------------------
 //  Handles globais dos controles
@@ -135,7 +171,7 @@ static std::wstring g_branchLookupUrl;
 static HWND g_hwndFooter = nullptr;
 static constexpr int FOOTER_X = 246;
 static constexpr int FOOTER_Y_OFFSET = -28;
-static constexpr wchar_t FOOTER_TEXT[] = L"V1.0.1 - 17/08/2026";
+static constexpr const wchar_t* FOOTER_TEXT = APP_VERSION;
 static constexpr COLORREF FOOTER_TEXT_COLOR = RGB(0, 182, 255);
 
 // Estado hover/click para owner-draw do botao + e lixeira.
@@ -522,6 +558,58 @@ static bool RunCommand(const std::wstring& command, const std::wstring& workingD
     return exitCode == 0;
 }
 
+
+// ---------------------------------------------------------------------------
+//  Procura por marcadores de conflito de merge nao resolvidos nos arquivos
+//  rastreados pelo git (working tree). Retorna os paths (um por linha) dos
+//  arquivos que contem "<<<<<<<" ou ">>>>>>>". Scanneia em C++ puro pra
+//  evitar problemas de escape de '<' e '>' no cmd.exe.
+//  Arquivos > 5MB sao pulados (provavelmente binarios).
+// ---------------------------------------------------------------------------
+static std::wstring FindConflictMarkersInTrackedFiles(const std::wstring& folder)
+{
+    std::wstring lsOutput;
+    RunCommand(L"git ls-files", folder, lsOutput);
+
+    std::wstring result;
+    std::wistringstream ss(lsOutput);
+    std::wstring relPath;
+    while (std::getline(ss, relPath))
+    {
+        if (!relPath.empty() && relPath.back() == L'\r')
+            relPath.pop_back();
+        if (relPath.empty()) continue;
+
+        const std::wstring fullPath = folder + L"\\" + relPath;
+
+        // Abre em modo binario pra nao ter surpresa com traducao de \r\n.
+        std::ifstream f(fullPath, std::ios::binary);
+        if (!f) continue;
+
+        // Le em chunks pra nao carregar arquivo gigante na memoria.
+        char buf[8192];
+        std::string content;
+        bool found = false;
+        while (f.read(buf, sizeof(buf)) || f.gcount() > 0)
+        {
+            content.append(buf, static_cast<size_t>(f.gcount()));
+            if (content.find("<<<<<<<") != std::string::npos ||
+                content.find(">>>>>>>") != std::string::npos)
+            {
+                found = true;
+                break;
+            }
+            // Limita a 5MB por arquivo (passa de 5MB sem marcador = binario/asset grande).
+            if (content.size() > 5 * 1024 * 1024) break;
+        }
+        if (!found) continue;
+
+        if (!result.empty()) result += L"\r\n";
+        result += relPath;
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 //  Monta a URL do repo com token embutido para autenticação
 // ---------------------------------------------------------------------------
@@ -672,6 +760,207 @@ struct PushParams
     std::wstring commitMsg;
 };
 
+// ---------------------------------------------------------------------------
+//  NUCLEAR SAFEGUARD - backup / restore da working tree.
+//
+//  O programa JAMAIS deve permitir que o git (ou qualquer outro processo)
+//  modifique os arquivos locais do usuario. Para garantir isso:
+//    1. Antes de QUALQUER operacao git, copiamos todos os arquivos
+//       rastreados (git ls-files) para um diretorio temporario unico.
+//    2. Apos todas as operacoes git, comparamos byte-a-byte cada arquivo
+//       rastreado com o backup. Se algum foi modificado, RESTAURAMOS do
+//       backup. O estado final da working tree e identico ao inicial.
+//    3. Se o backup falhar (disco cheio / sem permissao), abortamos o push.
+//
+//  Mesmo que uma versao futura do codigo reintroduza acidentalmente um
+//  comando git que mexa em arquivos (pull/merge/rebase/checkout), o
+//  restore vai desfazer a alteracao.
+// ---------------------------------------------------------------------------
+
+// Cria recursivamente todos os diretorios pais de `path` (que e um caminho
+// de arquivo completo). Idempotente.
+static void EnsureParentDirExists(const std::wstring& path)
+{
+    const size_t pos = path.find_last_of(L"\\");
+    if (pos == std::wstring::npos || pos == 0) return;
+    const std::wstring dir = path.substr(0, pos);
+
+    // Percorre cada componente do caminho e cria os diretorios.
+    size_t start = 0;
+    while (start < dir.size())
+    {
+        const size_t next = dir.find(L"\\", start);
+        if (next == std::wstring::npos) break;
+        const std::wstring partial = dir.substr(0, next);
+        if (!partial.empty() && partial.back() != L':' && partial.size() > 2)
+            CreateDirectoryW(partial.c_str(), nullptr);
+        start = next + 1;
+    }
+    CreateDirectoryW(dir.c_str(), nullptr);
+}
+
+// Copia todos os arquivos rastreados pelo git (git ls-files) de `folder`
+// para um diretorio temporario unico. Retorna o caminho do backup dir,
+// ou string vazia em caso de falha (inclui o caso de nao ter repo git).
+static std::wstring BackupWorkingTree(const std::wstring& folder)
+{
+    wchar_t tempPath[MAX_PATH] = {0};
+    if (!GetTempPathW(MAX_PATH, tempPath)) return L"";
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t backupDirBuf[MAX_PATH] = {0};
+    swprintf_s(backupDirBuf, MAX_PATH,
+        L"%sEasyGitPusher_backup_%04u%02u%02u_%02u%02u%02u_%lu",
+        tempPath, st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond,
+        static_cast<unsigned long>(GetCurrentProcessId()));
+
+    if (!CreateDirectoryW(backupDirBuf, nullptr)) return L"";
+
+    std::wstring lsOutput;
+    if (!RunCommand(L"git ls-files", folder, lsOutput)) return L"";
+
+    std::wistringstream ss(lsOutput);
+    std::wstring relPath;
+    while (std::getline(ss, relPath))
+    {
+        if (!relPath.empty() && relPath.back() == L'\r') relPath.pop_back();
+        if (relPath.empty()) continue;
+
+        const std::wstring srcPath = folder + L"\\" + relPath;
+        const std::wstring dstPath = std::wstring(backupDirBuf) + L"\\" + relPath;
+
+        EnsureParentDirExists(dstPath);
+        // FALSE = sobrescreve se ja existir.
+        CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE);
+    }
+
+    return backupDirBuf;
+}
+
+// Compara dois arquivos byte-a-byte. Retorna true se forem identicos.
+// Buffers alocados no heap (nao na pilha) pra evitar warning C6262 de stack.
+static bool FilesAreIdentical(const std::wstring& pathA, const std::wstring& pathB)
+{
+    std::ifstream a(pathA, std::ios::binary);
+    std::ifstream b(pathB, std::ios::binary);
+    if (!a.is_open() || !b.is_open()) return false;
+
+    constexpr size_t BUF_SZ = 8192;
+    std::vector<char> bufA(BUF_SZ);
+    std::vector<char> bufB(BUF_SZ);
+    while (a && b)
+    {
+        a.read(bufA.data(), static_cast<std::streamsize>(BUF_SZ));
+        b.read(bufB.data(), static_cast<std::streamsize>(BUF_SZ));
+        const std::streamsize nA = a.gcount();
+        const std::streamsize nB = b.gcount();
+        if (nA != nB) return false;
+        if (nA > 0 && std::memcmp(bufA.data(), bufB.data(), static_cast<size_t>(nA)) != 0) return false;
+    }
+    // Ambos devem estar no fim.
+    return a.gcount() == 0 && b.gcount() == 0;
+}
+
+// Restaura qualquer arquivo rastreado que tenha sido modificado pelo git
+// (ou por qualquer outra coisa durante o push). Compara cada arquivo do
+// backup com o da working tree; se diferir (tamanho ou conteudo), restaura
+// do backup. Retorna a lista de arquivos restaurados (um por linha).
+static std::wstring RestoreWorkingTree(const std::wstring& folder, const std::wstring& backupDir)
+{
+    if (backupDir.empty()) return L"";
+
+    std::wstring restoredList;
+
+    // Pilha explicita de diretorios para processar (nao usa std::function).
+    std::vector<std::wstring> dirs;
+    dirs.push_back(backupDir);
+
+    while (!dirs.empty())
+    {
+        const std::wstring currentDir = dirs.back();
+        dirs.pop_back();
+
+        const std::wstring pattern = currentDir + L"\\*";
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+
+        do
+        {
+            if (wcscmp(fd.cFileName, L".")  == 0) continue;
+            if (wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            const std::wstring backupPath = currentDir + L"\\" + fd.cFileName;
+            const std::wstring relPath    = backupPath.substr(backupDir.size() + 1);
+            const std::wstring treePath   = folder + L"\\" + relPath;
+
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                dirs.push_back(backupPath);
+                continue;
+            }
+
+            // Verifica se a working tree tem o arquivo e se e identico.
+            bool differs = false;
+            WIN32_FIND_DATAW fdTree;
+            HANDLE hFindTree = FindFirstFileW(treePath.c_str(), &fdTree);
+            if (hFindTree == INVALID_HANDLE_VALUE)
+            {
+                differs = true; // arquivo sumiu da working tree
+            }
+            else
+            {
+                FindClose(hFindTree);
+                if (fd.nFileSizeLow  != fdTree.nFileSizeLow  ||
+                    fd.nFileSizeHigh != fdTree.nFileSizeHigh)
+                {
+                    differs = true;
+                }
+                else if (!FilesAreIdentical(backupPath, treePath))
+                {
+                    differs = true;
+                }
+            }
+
+            if (differs)
+            {
+                EnsureParentDirExists(treePath);
+                CopyFileW(backupPath.c_str(), treePath.c_str(), FALSE);
+                if (!restoredList.empty()) restoredList += L"\r\n";
+                restoredList += relPath;
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    return restoredList;
+}
+
+// Deleta recursivamente um diretorio e tudo dentro dele.
+static void DeleteDirectoryRecursive(const std::wstring& path)
+{
+    const std::wstring pattern = path + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (wcscmp(fd.cFileName, L".")  == 0) continue;
+            if (wcscmp(fd.cFileName, L"..") == 0) continue;
+            const std::wstring sub = path + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                DeleteDirectoryRecursive(sub);
+            else
+                DeleteFileW(sub.c_str());
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+    RemoveDirectoryW(path.c_str());
+}
+
 static void DoPushWorker(const std::wstring& folder, const std::wstring& repo,
     const std::wstring& token, const std::wstring& commitMsgIn)
 {
@@ -687,126 +976,150 @@ static void DoPushWorker(const std::wstring& folder, const std::wstring& repo,
     std::wstring output{};
     bool finalSuccess = false;
 
-    do
+    // [1/9] BACKUP NUCLEAR - copia todos os arquivos tracked para um diretorio
+    // temporario antes de qualquer operacao git. Se algo der errado (incluindo
+    // uma versao futura do codigo que acidentalmente chame git pull/merge/
+    // rebase/checkout), o restore no final vai desfazer qualquer alteracao
+    // nos arquivos locais. Se o backup falhar, abortamos o push.
+    AppendLog(L"[1/9] Fazendo backup de segurança dos arquivos locais...");
+    std::wstring backupDir = BackupWorkingTree(folder);
+    if (backupDir.empty())
     {
-        const std::wstring gitDir = folder + L"\\.git";
-        const DWORD attrs = GetFileAttributesW(gitDir.c_str());
-        const bool hasGit = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
-
-        if (!hasGit)
+        AppendLog(L"[ERRO] Falha ao fazer backup dos arquivos locais.");
+        AppendLog(L"       O push foi abortado por segurança - sem backup, não");
+        AppendLog(L"       arriscamos modificar seus arquivos em caso de erro.");
+        AppendLog(L"       Verifique espaço em disco e permissões no diretório temp.");
+        finalSuccess = false;
+    }
+    else
+    {
+        AppendLog(L"Backup OK em: " + backupDir);
+        AppendLog(L"");
+        do
         {
-            AppendLog(L"[1/7] Inicializando repositório git...");
-            RunCommand(L"git init", folder, output);
-            AppendLog(output);
-        }
-        else
-        {
-            AppendLog(L"[1/7] Repositório git já existe, pulando init.");
-        }
+            const std::wstring gitDir = folder + L"\\.git";
+            const DWORD attrs = GetFileAttributesW(gitDir.c_str());
+            const bool hasGit = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
 
-        AppendLog(L"[2/7] Configurando remote 'origin'...");
-        RunCommand(L"git remote remove origin", folder, output);
-        const bool remoteOk = RunCommand(L"git remote add origin \"" + authUrl + L"\"", folder, output);
-        AppendLog(output);
-        if (!remoteOk)
-        {
-            AppendLog(L"[ERRO] Não foi possível configurar o remote. Abortando.");
-            break;
-        }
-
-        AppendLog(L"[3/7] Adicionando arquivos (git add -A)...");
-        RunCommand(L"git -c core.safecrlf=false add -A", folder, output);
-        AppendLog(output);
-
-        AppendLog(L"[4/7] Verificando arquivos grandes (Git LFS)...");
-        SetupLfs(folder);
-
-        AppendLog(L"[5/7] Criando commit...");
-        const bool committed = RunCommand(L"git commit -m \"" + commitMsg + L"\"", folder, output);
-        AppendLog(output);
-        if (!committed)
-            AppendLog(L"(Sem alterações novas para commitar - seguindo para o push mesmo assim)");
-
-        // Branch = selecionado no dropdown (validado em DoPush antes da thread).
-        AppendLog(L"[6/7] Sincronizando branch (" + g_selectedBranch + L")...");
-        std::wstring branchOutput{};
-        RunCommand(L"git rev-parse --abbrev-ref HEAD", folder, branchOutput);
-        std::wstring localBranch = branchOutput;
-        while (!localBranch.empty() && (localBranch.back() == L'\n' || localBranch.back() == L'\r'))
-            localBranch.pop_back();
-
-        std::wstring branch = g_selectedBranch;
-        if (localBranch.empty() || localBranch == L"HEAD")
-        {
-            RunCommand(L"git checkout -B " + branch, folder, output);
-            AppendLog(output);
-        }
-        else if (localBranch != branch)
-        {
-            AppendLog(L"Renomeando branch local '" + localBranch + L"' para '" + branch + L"'...");
-            RunCommand(L"git branch -M " + branch, folder, output);
-            AppendLog(output);
-        }
-        else
-        {
-            AppendLog(L"Branch atual: " + branch);
-        }
-
-        AppendLog(L"[7/7] Enviando para o GitHub (git push)...");
-        bool pushOk = RunCommand(L"git push -u origin " + branch, folder, output);
-        AppendLog(output);
-
-        // Bruteforce: se o push foi rejeitado porque o remote tem commits que
-        // nao temos localmente, faz git pull --rebase para integrar as mudancas
-        // remotas (se possivel sem conflito) e em seguida FORCE-PUSH para
-        // garantir que o conteudo local sobrescreva o remote. Se o rebase
-        // encontrar conflitos, aborta o rebase e faz mesmo assim o force-push
-        // (o conteudo local vence).
-        if (!pushOk && (output.find(L"rejected") != std::wstring::npos ||
-                        output.find(L"fetch first") != std::wstring::npos ||
-                        output.find(L"non-fast-forward") != std::wstring::npos))
-        {
-            AppendLog(L"");
-            AppendLog(L"[7.5/7] Push rejeitado pelo remote. Tentando git pull --rebase");
-            AppendLog(L"         para integrar mudancas remotas antes do bruteforce push...");
-
-            const std::wstring pullCmd = L"git pull --rebase origin " + branch;
-            std::wstring pullOutput;
-            const bool pullOk = RunCommand(pullCmd, folder, pullOutput);
-            AppendLog(pullOutput);
-
-            if (pullOk) {
-                AppendLog(L"Pull --rebase OK. Forcando push (git push --force)...");
-                AppendLog(L"");
-                output.clear();
-                pushOk = RunCommand(L"git push --force -u origin " + branch, folder, output);
-                AppendLog(output);
-            } else {
-                AppendLog(L"[AVISO] git pull --rebase encontrou conflitos. Abortando rebase");
-                AppendLog(L"         e fazendo bruteforce push (conteudo local sobrescreve");
-                AppendLog(L"         o remote - qualquer mudanca remota conflitante sera perdida)...");
-                std::wstring abortOutput;
-                RunCommand(L"git rebase --abort", folder, abortOutput);
-                AppendLog(abortOutput);
-                AppendLog(L"");
-                AppendLog(L"[7.6/7] Forcando push (git push --force)...");
-                output.clear();
-                pushOk = RunCommand(L"git push --force -u origin " + branch, folder, output);
+            if (!hasGit)
+            {
+                AppendLog(L"[2/9] Inicializando repositório git...");
+                RunCommand(L"git init", folder, output);
                 AppendLog(output);
             }
-        }
+            else
+            {
+                AppendLog(L"[2/9] Repositório git já existe, pulando init.");
+            }
 
-        if (pushOk)
-        {
-            AppendLog(L"===== Push concluido com sucesso! =====");
-            finalSuccess = true;
-        }
-        else
-        {
-            AppendLog(L"===== Push falhou. Veja os detalhes acima. =====");
-        }
+            AppendLog(L"[3/9] Configurando remote 'origin'...");
+            RunCommand(L"git remote remove origin", folder, output);
+            const bool remoteOk = RunCommand(L"git remote add origin \"" + authUrl + L"\"", folder, output);
+            AppendLog(output);
+            if (!remoteOk)
+            {
+                AppendLog(L"[ERRO] Não foi possível configurar o remote. Abortando.");
+                break;
+            }
 
-    } while (false);
+            // [4/9] Checagem de conflito: procura marcadores de conflito de merge
+            // (<<<<<<< ======= >>>>>>>) nos arquivos tracked. Se encontrar, RECUSA
+            // o push - nao tenta abortar rebase/merge automaticamente (esses
+            // comandos tambem mexem em arquivos locais, que e exatamente o que
+            // estamos evitando). O usuario resolve manualmente.
+            AppendLog(L"[4/9] Procurando marcadores de conflito não resolvidos...");
+            const std::wstring conflictFiles = FindConflictMarkersInTrackedFiles(folder);
+            if (!conflictFiles.empty())
+            {
+                AppendLog(L"[ERRO] Conflitos de merge não resolvidos encontrados nos arquivos:");
+                AppendLog(conflictFiles);
+                AppendLog(L"");
+                AppendLog(L"Esses arquivos contêm marcadores <<<<<<< ======= >>>>>>>");
+                AppendLog(L"que vão quebrar a compilação. Resolva os conflitos manualmente");
+                AppendLog(L"(abra os arquivos no editor, remova as marcações mantendo");
+                AppendLog(L"o conteúdo correto) e tente o push de novo.");
+                AppendLog(L"");
+                AppendLog(L"O programa NÃO tenta resolver automaticamente - qualquer");
+                AppendLog(L"operação de merge/rebase do git modificaria seus arquivos");
+                AppendLog(L"locais, o que é inaceitável. Push abortado.");
+                finalSuccess = false;
+                break;
+            }
+            AppendLog(L"Nenhum marcador de conflito encontrado. Prosseguindo...");
+            AppendLog(L"");
+
+            AppendLog(L"[5/9] Adicionando arquivos (git add -A)...");
+            RunCommand(L"git -c core.safecrlf=false add -A", folder, output);
+            AppendLog(output);
+
+            AppendLog(L"[6/9] Verificando arquivos grandes (Git LFS)...");
+            SetupLfs(folder);
+
+            AppendLog(L"[7/9] Criando commit...");
+            const bool committed = RunCommand(L"git commit -m \"" + commitMsg + L"\"", folder, output);
+            AppendLog(output);
+            if (!committed)
+                AppendLog(L"(Sem alterações novas para commitar - seguindo para o push mesmo assim)");
+
+            // Branch = selecionado no dropdown (validado em DoPush antes da thread).
+            AppendLog(L"[8/9] Sincronizando branch (" + g_selectedBranch + L")...");
+            std::wstring branchOutput{};
+            RunCommand(L"git rev-parse --abbrev-ref HEAD", folder, branchOutput);
+            std::wstring localBranch = branchOutput;
+            while (!localBranch.empty() && (localBranch.back() == L'\n' || localBranch.back() == L'\r'))
+                localBranch.pop_back();
+
+            std::wstring branch = g_selectedBranch;
+            if (localBranch.empty() || localBranch == L"HEAD")
+            {
+                RunCommand(L"git checkout -B " + branch, folder, output);
+                AppendLog(output);
+            }
+            else if (localBranch != branch)
+            {
+                AppendLog(L"Renomeando branch local '" + localBranch + L"' para '" + branch + L"'...");
+                RunCommand(L"git branch -M " + branch, folder, output);
+                AppendLog(output);
+            }
+            else
+            {
+                AppendLog(L"Branch atual: " + branch);
+            }
+
+            // BRUTFORCE: sempre git push --force. O conteudo local sempre vence
+            // sobre o remote, sem negociacao. NUNCA usamos git pull/merge/rebase
+            // porque esses comandos modificam os arquivos locais do usuario -
+            // o que e inaceitavel. Se o remote tiver commits que nao temos,
+            // eles simplesmente sao descartados (e exatamente isso que "bruteforce"
+            // significa: local vence, remote obedece).
+            AppendLog(L"[9/9] Enviando para o GitHub (git push --force, bruteforce)...");
+            bool pushOk = RunCommand(L"git push --force -u origin " + branch, folder, output);
+            AppendLog(output);
+
+            if (pushOk)
+            {
+                AppendLog(L"===== Push concluído com sucesso! =====");
+                finalSuccess = true;
+            }
+            else
+            {
+                AppendLog(L"===== Push falhou. Veja os detalhes acima. =====");
+            }
+
+        } while (false);
+
+        // [RESTORE] RESTORE NUCLEAR - compara cada arquivo tracked com o backup.
+        // Qualquer arquivo que tenha sido modificado pelo git (ou por qualquer
+        // outra coisa) durante o push e restaurado byte-a-byte do backup. O
+        // estado final da working tree e identico ao inicial - garantido.
+        // Restore silencioso: compara cada arquivo tracked com o backup
+        // e restaura byte-a-byte se algum foi modificado pelo git durante
+        // o push. Nao loga nada - o restore e back-end, o usuario nao
+        // precisa saber (e nao deve ser interpelado em segunda pessoa).
+        RestoreWorkingTree(folder, backupDir);
+        DeleteDirectoryRecursive(backupDir);
+        backupDir.clear();
+    }
 
     g_lastPushSuccess = finalSuccess;
     PostMessageW(g_hMainWnd, WM_PUSH_DONE, 0, 0);
@@ -824,9 +1137,8 @@ static void DoPush()
 {
     const std::wstring repoUrl = GetWindowTextStr(g_hEditRepo);
     if (!IsValidGitUrl(repoUrl)) {
-        MessageBoxW(g_hMainWnd, L"Link de repositório inválido.\n"
-                            L"Use https://github.com/usuario/repo.git ou git@github.com:usuario/repo.git",
-                  L"Erro", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hMainWnd, MSG_BAD_REPO,
+                  DIALOG_TITLE_ERROR, MB_OK | MB_ICONERROR);
         return;
     }
     const int branchSel = static_cast<int>(SendMessageW(g_hComboBranch, CB_GETCURSEL, 0, 0));
@@ -835,10 +1147,8 @@ static void DoPush()
         selectedBranch = g_remoteBranches[branchSel];
     }
     if (selectedBranch.empty()) {
-        MessageBoxW(g_hMainWnd, L"Selecione um branch antes de enviar.\n"
-                            L"Se o dropdown está vazio, aguarde o lookup automático terminar\n"
-                            L"ou verifique se o link está correto.",
-                  L"Erro", MB_OK | MB_ICONWARNING);
+        MessageBoxW(g_hMainWnd, MSG_NO_BRANCH,
+                  DIALOG_TITLE_ERROR, MB_OK | MB_ICONWARNING);
         return;
     }
     g_selectedBranch = selectedBranch;
@@ -853,8 +1163,8 @@ static void DoPush()
     if (folder.empty() || repo.empty() || token.empty())
     {
         MessageBoxW(g_hMainWnd,
-            L"Preencha a pasta, o link do repositório e o token antes de continuar.",
-            L"Campos incompletos", MB_OK | MB_ICONWARNING);
+            MSG_NO_FIELDS,
+            DIALOG_TITLE_INCOMPLETE, MB_OK | MB_ICONWARNING);
         return;
     }
 
@@ -870,7 +1180,7 @@ static void DoPush()
 
     g_isPushing = true;
     EnableWindow(GetDlgItem(g_hMainWnd, ID_BTN_PUSH), FALSE);
-    SetWindowTextW(GetDlgItem(g_hMainWnd, ID_BTN_PUSH), L"Enviando...");
+    SetWindowTextW(GetDlgItem(g_hMainWnd, ID_BTN_PUSH), BTN_PUSH_SENDING);
 
     PushParams* const params = new PushParams{ folder, repo, token, commitMsg };
     const uintptr_t handle = _beginthreadex(nullptr, 0, PushThreadProc, params, 0, nullptr);
@@ -880,9 +1190,9 @@ static void DoPush()
         delete params;
         g_isPushing = false;
         EnableWindow(GetDlgItem(g_hMainWnd, ID_BTN_PUSH), TRUE);
-        SetWindowTextW(GetDlgItem(g_hMainWnd, ID_BTN_PUSH), L"PUSH");
-        MessageBoxW(g_hMainWnd, L"Não foi possível iniciar o processo de push.",
-            L"Erro", MB_OK | MB_ICONERROR);
+        SetWindowTextW(GetDlgItem(g_hMainWnd, ID_BTN_PUSH), BTN_PUSH);
+        MessageBoxW(g_hMainWnd, MSG_THREAD_FAIL,
+            DIALOG_TITLE_ERROR, MB_OK | MB_ICONERROR);
     }
     else
     {
@@ -902,8 +1212,8 @@ static void BrowseForFolder()
 
     if (FAILED(hr))
     {
-        MessageBoxW(g_hMainWnd, L"Não foi possível abrir o seletor de pastas.",
-            L"Erro", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hMainWnd, MSG_FOLDER_FAIL,
+            DIALOG_TITLE_ERROR, MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -969,8 +1279,8 @@ static void AddCurrentAsProfile()
     if (folder.empty() && repo.empty())
     {
         MessageBoxW(g_hMainWnd,
-            L"Preencha ao menos a pasta ou o link do repositório antes de adicionar a lista.",
-            L"Campos vazios", MB_OK | MB_ICONWARNING);
+            MSG_NO_SAVE_FIELDS,
+            DIALOG_TITLE_FIELDS, MB_OK | MB_ICONWARNING);
         return;
     }
 
@@ -998,7 +1308,7 @@ static void DeleteProfileAt(int index)
 
     const std::wstring msg = L"Remover \"" + g_profiles[index].name +
         L"\" da lista de repositórios?\n\n(Isso não apaga nada no GitHub nem na sua pasta local, só tira da lista aqui.)";
-    const int choice = MessageBoxW(g_hMainWnd, msg.c_str(), L"Remover repositório", MB_YESNO | MB_ICONQUESTION);
+    const int choice = MessageBoxW(g_hMainWnd, msg.c_str(), DIALOG_TITLE_REMOVE, MB_YESNO | MB_ICONQUESTION);
     if (choice != IDYES) return;
 
     g_profiles.erase(g_profiles.begin() + index);
@@ -1568,7 +1878,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Consolas");
 
         // ---------------- Barra lateral "Meus repos" ----------------
-        HWND hSidebarLabel = CreateWindowW(L"STATIC", L"Meus repos", WS_VISIBLE | WS_CHILD,
+        HWND hSidebarLabel = CreateWindowW(L"STATIC", LABEL_SIDEBAR, WS_VISIBLE | WS_CHILD,
             SIDEBAR_X + 60, 15, SIDEBAR_WIDTH - 40, 24, hwnd, nullptr, nullptr, nullptr);
 
         g_hBtnAddRepo = CreateWindowW(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
@@ -1629,10 +1939,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // mesmo top-margin onde a sidebar tem o rotulo "Meus repos" em y=15.
         // Altura 30px para acomodar uma fonte de 20pt (~26.7px) sem clipping.
         // (Valores ajustados: y=9, h=32 — posicao final do titulo.)
-        HWND hTitle = CreateWindowW(L"STATIC", L"EasyGitPusher", WS_VISIBLE | WS_CHILD,
+        HWND hTitle = CreateWindowW(L"STATIC", APP_TITLE, WS_VISIBLE | WS_CHILD,
             MAIN_X, 9, 400, 32, hwnd, nullptr, nullptr, nullptr);
 
-        CreateWindowW(L"STATIC", L"Pasta a enviar:", WS_VISIBLE | WS_CHILD,
+        CreateWindowW(L"STATIC", LABEL_FOLDER, WS_VISIBLE | WS_CHILD,
             MAIN_X, y, 200, 20, hwnd, nullptr, nullptr, nullptr);
         y += 19;
         // WS_EX_CLIENTEDGE (em vez de WS_BORDER) desenha a borda FORA do
@@ -1640,13 +1950,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hEditFolder = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL,
             MAIN_X, y, 480, 26, hwnd, CtrlId(ID_EDIT_FOLDER), nullptr, nullptr);
-        HWND hBrowse = CreateWindowW(L"BUTTON", L"Procurar...",
+        HWND hBrowse = CreateWindowW(L"BUTTON", BTN_BROWSE,
             WS_VISIBLE | WS_CHILD, MAIN_X + 490, y, 100, 26,
             hwnd, CtrlId(ID_BTN_BROWSE), nullptr, nullptr);
         y += 34;
 
         CreateWindowW(L"STATIC",
-            L"Link do repositório (ex: https://github.com/usuário/repo.git):",
+            LABEL_REPO,
             WS_VISIBLE | WS_CHILD, MAIN_X, y, 480, 20, hwnd, nullptr, nullptr, nullptr);
         y += 19;
         g_hEditRepo = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -1654,7 +1964,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             MAIN_X, y, 590, 26, hwnd, CtrlId(ID_EDIT_REPO), nullptr, nullptr);
         y += 34;
 
-        CreateWindowW(L"STATIC", L"Token de acesso (Personal Access Token):",
+        CreateWindowW(L"STATIC", LABEL_TOKEN,
             WS_VISIBLE | WS_CHILD, MAIN_X, y, 480, 20, hwnd, nullptr, nullptr, nullptr);
         y += 19;
         // Layout: token EDIT (266 = 480 - 214, conforme solicitado)
@@ -1668,11 +1978,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hEditToken = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_PASSWORD,
             MAIN_X, y, TOKEN_EDIT_W, 26, hwnd, CtrlId(ID_EDIT_TOKEN), nullptr, nullptr);
-        g_hChkShowToken = CreateWindowW(L"BUTTON", L"Mostrar",
+        g_hChkShowToken = CreateWindowW(L"BUTTON", BTN_SHOW_TOKEN,
             WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, TOKEN_CHK_X, y + 1, TOKEN_CHK_W, 26,
             hwnd, CtrlId(ID_CHK_SHOWTOKEN), nullptr, nullptr);
 
-        CreateWindowW(L"STATIC", L"Selecione a Branch:",
+        CreateWindowW(L"STATIC", LABEL_BRANCH,
             WS_VISIBLE | WS_CHILD, BRANCH_COMBO_X, y - 19, 200, 20, hwnd, nullptr, nullptr, nullptr);
 
         g_hComboBranch = CreateWindowW(L"COMBOBOX", L"",
@@ -1680,11 +1990,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             BRANCH_COMBO_X, y, BRANCH_COMBO_W, 200,
             hwnd, CtrlId(ID_COMBO_BRANCH), nullptr, nullptr);
 
-        SendMessageW(g_hComboBranch, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"(branch)"));
+        SendMessageW(g_hComboBranch, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(COMBO_BRANCH_PLACEHOLDER));
         SendMessageW(g_hComboBranch, CB_SETCURSEL, 0, 0);
         y += 34;
 
-        CreateWindowW(L"STATIC", L"Mensagem do commit (opcional):",
+        CreateWindowW(L"STATIC", LABEL_COMMIT,
             WS_VISIBLE | WS_CHILD, MAIN_X, y, 480, 20, hwnd, nullptr, nullptr, nullptr);
         y += 20;
         g_hEditCommitMsg = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -1692,12 +2002,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             MAIN_X, y, 590, 26, hwnd, CtrlId(ID_EDIT_COMMITMSG), nullptr, nullptr);
         y += 34;
 
-        HWND hPush = CreateWindowW(L"BUTTON", L"PUSH",
+        HWND hPush = CreateWindowW(L"BUTTON", BTN_PUSH,
             WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, MAIN_X, y, 590, 30,
             hwnd, CtrlId(ID_BTN_PUSH), nullptr, nullptr);
         y += 34;
 
-        CreateWindowW(L"STATIC", L"Log do Git:", WS_VISIBLE | WS_CHILD,
+        CreateWindowW(L"STATIC", LABEL_LOG, WS_VISIBLE | WS_CHILD,
             MAIN_X, y, 100, 20, hwnd, nullptr, nullptr, nullptr);
         y += 20;
         g_hEditLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -1854,11 +2164,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SetWindowTextW(GetDlgItem(g_hMainWnd, ID_BTN_PUSH), L"PUSH");
 
         if (g_lastPushSuccess)
-            MessageBoxW(g_hMainWnd, L"Push realizado com sucesso!",
-                L"Concluído", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(g_hMainWnd, MSG_PUSH_OK,
+                DIALOG_TITLE_DONE, MB_OK | MB_ICONINFORMATION);
         else
-            MessageBoxW(g_hMainWnd, L"O push falhou. Veja o log na janela para detalhes.",
-                L"Erro", MB_OK | MB_ICONERROR);
+            MessageBoxW(g_hMainWnd, MSG_PUSH_FAIL,
+                DIALOG_TITLE_ERROR, MB_OK | MB_ICONERROR);
         return 0;
     }
 
@@ -1977,7 +2287,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
     const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hrCo) && hrCo != RPC_E_CHANGED_MODE)
     {
-        MessageBoxW(nullptr, L"Falha ao inicializar COM.", L"Erro", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, MSG_COM_FAIL, DIALOG_TITLE_ERROR, MB_OK | MB_ICONERROR);
         return 1;
     }
 
@@ -2016,7 +2326,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
     const int winX = rcWork.left + ((rcWork.right - rcWork.left) - 900) / 2;
     const int winY = rcWork.top  + ((rcWork.bottom - rcWork.top) - 550) / 2;
     g_hMainWnd = CreateWindowExW(
-        0, className, L"EasyGitPusher",
+        0, className, APP_TITLE,
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
         winX, winY, 900, 550,
         nullptr, nullptr, hInstance, nullptr
